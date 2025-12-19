@@ -1,0 +1,168 @@
+cat login.php 
+<?php
+session_start();
+ 
+if ($_SERVER["REQUEST_METHOD"] === "POST") {
+    $user = $_POST['user'] ?? '';
+    $pass = $_POST['pass'] ?? '';
+ 
+    if ($user === 'admin' && $pass === 'admin123') {
+        $_SESSION['user'] = 'admin';
+        header("Location: admin.php");
+        exit;
+    }
+ 
+    if ($user === 'alice' && $pass === 'alice123') {
+        $_SESSION['user'] = 'alice';
+        header("Location: index.php");
+        exit;
+    }
+ 
+    $error = "Invalid credentials";
+}
+?>
+<!DOCTYPE html>
+<html>
+<body>
+ 
+<h2>Login</h2>
+ 
+<form method="POST">
+    Username: <input name="user"><br><br>
+    Password: <input type="password" name="pass"><br><br>
+    <button type="submit">Login</button>
+</form>
+ 
+<?php if (!empty($error)) echo "<p style='color:red'>$error</p>"; ?>
+ 
+</body>
+</html>
+ 
+cat index.php 
+<?php
+session_set_cookie_params([
+    'path' => '/',
+    'httponly' => 0,   // intentionally weak for lab
+    'secure' => false,
+    'samesite' => 'Lax'
+]);
+ 
+session_start();
+ 
+if (!isset($_SESSION['user'])) {
+    header("Location: login.php");
+    exit;
+}
+ 
+$commentsFile = __DIR__ . "/comments.txt";
+if (!file_exists($commentsFile)) {
+    file_put_contents($commentsFile, "");
+}
+ 
+if ($_SERVER["REQUEST_METHOD"] === "POST") {
+    $comment = $_POST["comment"] ?? "";
+    $user = $_SESSION['user'];
+    $time = date("Y-m-d H:i");
+ 
+    // RAW storage (intentional)
+    $entry = "[$time] $user: $comment\n";
+    file_put_contents($commentsFile, $entry, FILE_APPEND);
+}
+?>
+<!DOCTYPE html>
+<html>
+<head>
+    <title>XSS Lab – User View</title>
+    <style>
+        body { font-family: Arial; background:#f2f2f2; }
+        .container {
+            width: 60%;
+            margin: auto;
+            margin-top: 40px;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+        }
+        textarea { width:100%; height:80px; }
+        .comment {
+            background:#eee;
+            padding:10px;
+            margin-top:5px;
+            border-radius:5px;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+ 
+<h2>💬 Public Comment Page</h2>
+<p>Logged in as: <b><?= htmlspecialchars($_SESSION['user']) ?></b></p>
+ 
+<form method="POST">
+    <textarea name="comment" placeholder="Write a comment..."></textarea><br><br>
+    <button type="submit">Post Comment</button>
+</form>
+ 
+<hr>
+ 
+<h3>Public Comments (Safe)</h3>
+ 
+<?php
+$lines = file($commentsFile, FILE_IGNORE_NEW_LINES);
+foreach ($lines as $line) {
+    echo '<div class="comment">' . htmlspecialchars($line) . '</div>';
+}
+?>
+ 
+</div>
+</body>
+</html>
+ 
+ 
+ 
+cat admin.php
+<?php
+session_set_cookie_params([
+    'path' => '/',
+    'httponly' => false,
+    'secure' => false,
+    'samesite' => 'Lax'
+]);
+ 
+session_start();
+ 
+if (!isset($_SESSION['user']) || $_SESSION['user'] !== 'admin') {
+    die("Admins only");
+}
+ 
+// -------------------------------------
+// SAFE SERVER-SIDE LOGGING
+// -------------------------------------
+$log = sprintf(
+    "[%s] Admin accessed dashboard | IP: %s | Session: %s\n",
+    date("Y-m-d H:i:s"),
+    $_SERVER['REMOTE_ADDR'] ?? 'unknown',
+    session_id()
+);
+ 
+file_put_contents("admin_session.txt", $log, FILE_APPEND);
+?>
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Admin Dashboard</title>
+</head>
+<body>
+ 
+<h1>🛠 Admin Dashboard</h1>
+<p><b>Note:</b> Comments below are rendered RAW (intentional lab vulnerability)</p>
+ 
+<div style="border:1px solid #ccc; padding:10px;">
+<?php
+// RAW OUTPUT — STORED XSS TRIGGERS HERE
+echo nl2br(file_get_contents("comments.txt"));
+?>
+</div>
+ 
+</body>
+</html>
